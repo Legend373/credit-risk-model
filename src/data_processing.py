@@ -1,15 +1,15 @@
 import pandas as pd
 import numpy as np
 from pathlib import Path
+import joblib
 
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, OneHotEncoder
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
 
 # =====================================================
-# 1. COLUMN DEFINITIONS
+# 1. CONSTANTS
 # =====================================================
 
 TARGET_COL = "FraudResult"
@@ -17,57 +17,78 @@ CUSTOMER_ID_COL = "CustomerId"
 AMOUNT_COL = "Amount"
 DATE_COL = "TransactionStartTime"
 
+DROP_COLUMNS = [
+    "TransactionId",
+    "BatchId",
+    "AccountId",
+    "SubscriptionId",
+    "ProductId",
+    CUSTOMER_ID_COL,
+    AMOUNT_COL,
+    DATE_COL
+]
+
 NUMERICAL_FEATURES = ["Value"]
 
-CATEGORICAL_FEATURES_OHE = [
+CATEGORICAL_OHE = [
     "CurrencyCode",
     "CountryCode",
     "ProviderId",
     "PricingStrategy"
 ]
 
-CATEGORICAL_FEATURES_WOE = [
+CATEGORICAL_WOE = [
     "ProductCategory",
     "ChannelId"
 ]
 
+AGG_FEATURES = [
+    "total_transaction_amount",
+    "average_transaction_amount",
+    "transaction_count",
+    "std_transaction_amount"
+]
+
+DATE_FEATURES = [
+    "transaction_hour",
+    "transaction_day",
+    "transaction_month",
+    "transaction_year"
+]
+
 # =====================================================
-# 2. WoE & IV
+# 2. WoE / IV
 # =====================================================
 
 def compute_woe_iv(feature, target):
-    df = pd.DataFrame({
-        "feature": feature.astype(str),
-        "target": target
-    })
-
-    total_good = (df["target"] == 0).sum()
-    total_bad = (df["target"] == 1).sum()
+    df = pd.DataFrame({"x": feature.astype(str), "y": target})
     eps = 1e-6
 
-    woe_map = {}
-    iv = 0.0
+    total_good = (df.y == 0).sum()
+    total_bad = (df.y == 1).sum()
 
-    for cat, group in df.groupby("feature"):
-        good = (group["target"] == 0).sum()
-        bad = (group["target"] == 1).sum()
+    woe_map, iv = {}, 0.0
 
-        good_rate = (good + eps) / (total_good + eps)
-        bad_rate = (bad + eps) / (total_bad + eps)
+    for val, g in df.groupby("x"):
+        good = (g.y == 0).sum()
+        bad = (g.y == 1).sum()
 
-        woe = np.log(good_rate / bad_rate)
-        woe_map[cat] = woe
-        iv += (good_rate - bad_rate) * woe
+        gr = (good + eps) / (total_good + eps)
+        br = (bad + eps) / (total_bad + eps)
+
+        woe = np.log(gr / br)
+        woe_map[val] = woe
+        iv += (gr - br) * woe
 
     return woe_map, iv
 
 # =====================================================
-# 3. AGGREGATION FEATURES
+# 3. AGGREGATION
 # =====================================================
 
 class AggregationFeatureGenerator(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None):
-        self.agg_ = (
+        self.stats_ = (
             X.groupby(CUSTOMER_ID_COL)[AMOUNT_COL]
             .agg(
                 total_transaction_amount="sum",
@@ -76,15 +97,14 @@ class AggregationFeatureGenerator(BaseEstimator, TransformerMixin):
                 std_transaction_amount="std"
             )
             .fillna(0)
-            .reset_index()
         )
         return self
 
     def transform(self, X):
-        return X.merge(self.agg_, on=CUSTOMER_ID_COL, how="left")
+        return X.merge(self.stats_, on=CUSTOMER_ID_COL, how="left")
 
 # =====================================================
-# 4. DATE FEATURES
+# 4. DATE FEATURES (NO SCALING)
 # =====================================================
 
 class DateFeatureExtractor(BaseEstimator, TransformerMixin):
@@ -93,61 +113,33 @@ class DateFeatureExtractor(BaseEstimator, TransformerMixin):
 
     def transform(self, X):
         X = X.copy()
-        X[DATE_COL] = pd.to_datetime(X[DATE_COL], errors="coerce")
+        dt = pd.to_datetime(X[DATE_COL], errors="coerce")
 
-        X["transaction_hour"] = X[DATE_COL].dt.hour
-        X["transaction_day"] = X[DATE_COL].dt.day
-        X["transaction_month"] = X[DATE_COL].dt.month
-        X["transaction_year"] = X[DATE_COL].dt.year
+        X["transaction_hour"] = dt.dt.hour
+        X["transaction_day"] = dt.dt.day
+        X["transaction_month"] = dt.dt.month
+        X["transaction_year"] = dt.dt.year
 
-        return X.drop(columns=[DATE_COL])
+        return X
 
 # =====================================================
-# 5. MAIN PROCESSOR (WITH SAVE)
+# 5. MAIN PROCESSOR (FIXED)
 # =====================================================
 
 class ModelReadyDataProcessor:
     """
-    Full feature engineering pipeline + WoE + IV
+    Produces a MODEL-CORRECT dataset:
+    - Date features preserved as integers
+    - Numeric & aggregate features scaled
+    - IDs removed
     """
 
-    def __init__(self, scaling_method="Standard"):
-        self.scaler = (
-            StandardScaler() if scaling_method == "Standard"
-            else MinMaxScaler()
-        )
+    def __init__(self):
+        self.scaler = StandardScaler()
+        self.ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
         self.woe_maps_ = {}
         self.iv_summary_ = None
-        self.pipeline = self._build_pipeline()
-
-    def _build_pipeline(self):
-        numeric_pipeline = Pipeline([
-            ("imputer", SimpleImputer(strategy="mean")),
-            ("scaler", self.scaler)
-        ])
-
-        ohe_pipeline = Pipeline([
-            ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
-        ])
-
-        preprocessor = ColumnTransformer(
-            transformers=[
-                ("num", numeric_pipeline, NUMERICAL_FEATURES),
-                ("ohe", ohe_pipeline, CATEGORICAL_FEATURES_OHE),
-                ("woe_imp",
-                 SimpleImputer(strategy="constant", fill_value="missing"),
-                 CATEGORICAL_FEATURES_WOE),
-            ],
-            remainder="drop",
-            verbose_feature_names_out=False
-        )
-
-        return Pipeline([
-            ("aggregation", AggregationFeatureGenerator()),
-            ("date_features", DateFeatureExtractor()),
-            ("preprocessing", preprocessor)
-        ])
+        self.final_columns_ = None
 
     # =============================
     # FIT
@@ -155,25 +147,30 @@ class ModelReadyDataProcessor:
     def fit(self, X: pd.DataFrame, y: pd.Series):
         y = y.astype(int)
 
-        X_processed = self.pipeline.fit_transform(X, y)
+        X = AggregationFeatureGenerator().fit_transform(X)
+        X = DateFeatureExtractor().transform(X)
 
-        feature_names = (
-            self.pipeline.named_steps["preprocessing"]
-            .get_feature_names_out()
-        )
+        # ---- WoE ----
+        iv_rows = []
+        for col in CATEGORICAL_WOE:
+            woe, iv = compute_woe_iv(X[col], y)
+            self.woe_maps_[col] = woe
+            iv_rows.append({"Feature": col, "IV": iv})
 
-        X_df = pd.DataFrame(X_processed, columns=feature_names, index=X.index)
+        self.iv_summary_ = pd.DataFrame(iv_rows).sort_values("IV", ascending=False)
 
-        iv_records = []
-        for col in CATEGORICAL_FEATURES_WOE:
-            woe_map, iv = compute_woe_iv(X_df[col], y)
-            self.woe_maps_[col] = woe_map
-            iv_records.append({"Feature": col, "IV": iv})
+        # ---- OHE ----
+        self.ohe.fit(X[CATEGORICAL_OHE])
 
-        self.iv_summary_ = (
-            pd.DataFrame(iv_records)
-            .sort_values("IV", ascending=False)
-            .reset_index(drop=True)
+        # ---- Scale ONLY numeric + aggregate ----
+        self.scaler.fit(X[NUMERICAL_FEATURES + AGG_FEATURES])
+
+        self.final_columns_ = (
+            NUMERICAL_FEATURES +
+            AGG_FEATURES +
+            DATE_FEATURES +
+            list(self.ohe.get_feature_names_out(CATEGORICAL_OHE)) +
+            [f"{c}_woe" for c in CATEGORICAL_WOE]
         )
 
         return self
@@ -182,38 +179,44 @@ class ModelReadyDataProcessor:
     # TRANSFORM
     # =============================
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        X_processed = self.pipeline.transform(X)
+        X = AggregationFeatureGenerator().fit_transform(X)
+        X = DateFeatureExtractor().transform(X)
 
-        feature_names = (
-            self.pipeline.named_steps["preprocessing"]
-            .get_feature_names_out()
+        # ---- Scale numeric + aggregate ONLY ----
+        scaled = self.scaler.transform(X[NUMERICAL_FEATURES + AGG_FEATURES])
+        scaled_df = pd.DataFrame(
+            scaled,
+            columns=NUMERICAL_FEATURES + AGG_FEATURES,
+            index=X.index
         )
 
-        X_df = pd.DataFrame(X_processed, columns=feature_names, index=X.index)
+        date_df = X[DATE_FEATURES].astype("Int64")
 
-        woe_features = {}
-        for col in CATEGORICAL_FEATURES_WOE:
-            woe_features[f"{col}_woe"] = (
-                X_df[col].astype(str)
-                .map(self.woe_maps_[col])
-                .fillna(0.0)
-            )
+        # ---- OHE ----
+        ohe_df = pd.DataFrame(
+            self.ohe.transform(X[CATEGORICAL_OHE]),
+            columns=self.ohe.get_feature_names_out(CATEGORICAL_OHE),
+            index=X.index
+        )
 
-        X_woe = pd.DataFrame(woe_features, index=X.index)
+        # ---- WoE ----
+        woe_df = pd.DataFrame({
+            f"{c}_woe": X[c].astype(str).map(self.woe_maps_[c]).fillna(0)
+            for c in CATEGORICAL_WOE
+        }, index=X.index)
 
         X_final = pd.concat(
-            [X_df.drop(columns=CATEGORICAL_FEATURES_WOE), X_woe],
+            [scaled_df, date_df, ohe_df, woe_df],
             axis=1
         )
 
-        return X_final
+        return X_final[self.final_columns_]
 
     # =============================
-    # SAVE TO CSV
+    # SAVE
     # =============================
-    def save_processed(self, X: pd.DataFrame,path: str = "../data/processed/processed.csv"):
+    def save_processed(self, X, path="../data/processed/processed.csv"):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-
         X.to_csv(path, index=False)
-        print(f"✅ Processed data saved to: {path.resolve()}")
+        print(f"✅ Saved to {path.resolve()}")
