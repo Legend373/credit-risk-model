@@ -13,7 +13,6 @@ data/**
 /.dvc/cache/
 
 # Misc
-*.txt
 .ipynb_checkpoints/
 .DS_Store
 .env
