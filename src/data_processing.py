@@ -1,194 +1,219 @@
-"""
-data_processing.py
---------------------------------
-Robust, automated, and reproducible data processing pipeline.
-
-✔ Uses sklearn.pipeline.Pipeline end-to-end
-✔ Transforms raw transaction data into model-ready format
-✔ Saves processed data to: data/processed/proccessed.csv
-
-Features implemented:
-- Customer-level aggregate features
-- Datetime feature extraction
-- Missing value handling
-- Categorical encoding (One-Hot or WoE)
-- Numerical standardization / normalization
-- Optional WoE + IV report generation
-"""
-
-import os
 import pandas as pd
+import numpy as np
+from pathlib import Path
 
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, OneHotEncoder
 from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, OneHotEncoder
 
-# Optional WoE
-try:
-    from xverse.transformers import WoEEncoder
-    WOE_AVAILABLE = True
-except ImportError:
-    WOE_AVAILABLE = False
+# =====================================================
+# 1. COLUMN DEFINITIONS
+# =====================================================
 
+TARGET_COL = "FraudResult"
+CUSTOMER_ID_COL = "CustomerId"
+AMOUNT_COL = "Amount"
+DATE_COL = "TransactionStartTime"
 
-# ==================================================
-# Custom Transformers
-# ==================================================
+NUMERICAL_FEATURES = ["Value"]
 
-class TransactionAggregates(BaseEstimator, TransformerMixin):
-    """Create customer-level aggregate transaction features."""
-    def __init__(self, customer_col="CustomerId", amount_col="Amount"):
-        self.customer_col = customer_col
-        self.amount_col = amount_col
+CATEGORICAL_FEATURES_OHE = [
+    "CurrencyCode",
+    "CountryCode",
+    "ProviderId",
+    "PricingStrategy"
+]
 
+CATEGORICAL_FEATURES_WOE = [
+    "ProductCategory",
+    "ChannelId"
+]
+
+# =====================================================
+# 2. WoE & IV
+# =====================================================
+
+def compute_woe_iv(feature, target):
+    df = pd.DataFrame({
+        "feature": feature.astype(str),
+        "target": target
+    })
+
+    total_good = (df["target"] == 0).sum()
+    total_bad = (df["target"] == 1).sum()
+    eps = 1e-6
+
+    woe_map = {}
+    iv = 0.0
+
+    for cat, group in df.groupby("feature"):
+        good = (group["target"] == 0).sum()
+        bad = (group["target"] == 1).sum()
+
+        good_rate = (good + eps) / (total_good + eps)
+        bad_rate = (bad + eps) / (total_bad + eps)
+
+        woe = np.log(good_rate / bad_rate)
+        woe_map[cat] = woe
+        iv += (good_rate - bad_rate) * woe
+
+    return woe_map, iv
+
+# =====================================================
+# 3. AGGREGATION FEATURES
+# =====================================================
+
+class AggregationFeatureGenerator(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None):
-        return self
-
-    def transform(self, X):
-        X = X.copy()
-        agg = (
-            X.groupby(self.customer_col)[self.amount_col]
+        self.agg_ = (
+            X.groupby(CUSTOMER_ID_COL)[AMOUNT_COL]
             .agg(
-                TotalTransactionAmount="sum",
-                AvgTransactionAmount="mean",
-                TransactionCount="count",
-                StdTransactionAmount="std",
+                total_transaction_amount="sum",
+                average_transaction_amount="mean",
+                transaction_count="count",
+                std_transaction_amount="std"
             )
             .fillna(0)
             .reset_index()
         )
-        return X.merge(agg, on=self.customer_col, how="left")
+        return self
 
+    def transform(self, X):
+        return X.merge(self.agg_, on=CUSTOMER_ID_COL, how="left")
 
-class DatetimeFeatures(BaseEstimator, TransformerMixin):
-    """Extract hour, day, month, year from TransactionStartTime."""
-    def __init__(self, datetime_col="TransactionStartTime"):
-        self.datetime_col = datetime_col
+# =====================================================
+# 4. DATE FEATURES
+# =====================================================
 
+class DateFeatureExtractor(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None):
         return self
 
     def transform(self, X):
         X = X.copy()
-        X[self.datetime_col] = pd.to_datetime(X[self.datetime_col], errors="coerce")
-        X["TransactionHour"] = X[self.datetime_col].dt.hour
-        X["TransactionDay"] = X[self.datetime_col].dt.day
-        X["TransactionMonth"] = X[self.datetime_col].dt.month
-        X["TransactionYear"] = X[self.datetime_col].dt.year
-        return X
+        X[DATE_COL] = pd.to_datetime(X[DATE_COL], errors="coerce")
 
+        X["transaction_hour"] = X[DATE_COL].dt.hour
+        X["transaction_day"] = X[DATE_COL].dt.day
+        X["transaction_month"] = X[DATE_COL].dt.month
+        X["transaction_year"] = X[DATE_COL].dt.year
 
-class DropColumns(BaseEstimator, TransformerMixin):
-    """Drop identifier and leakage-prone columns."""
-    def __init__(self, columns):
-        self.columns = columns
+        return X.drop(columns=[DATE_COL])
 
-    def fit(self, X, y=None):
+# =====================================================
+# 5. MAIN PROCESSOR (WITH SAVE)
+# =====================================================
+
+class ModelReadyDataProcessor:
+    """
+    Full feature engineering pipeline + WoE + IV
+    """
+
+    def __init__(self, scaling_method="Standard"):
+        self.scaler = (
+            StandardScaler() if scaling_method == "Standard"
+            else MinMaxScaler()
+        )
+        self.woe_maps_ = {}
+        self.iv_summary_ = None
+        self.pipeline = self._build_pipeline()
+
+    def _build_pipeline(self):
+        numeric_pipeline = Pipeline([
+            ("imputer", SimpleImputer(strategy="mean")),
+            ("scaler", self.scaler)
+        ])
+
+        ohe_pipeline = Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+        ])
+
+        preprocessor = ColumnTransformer(
+            transformers=[
+                ("num", numeric_pipeline, NUMERICAL_FEATURES),
+                ("ohe", ohe_pipeline, CATEGORICAL_FEATURES_OHE),
+                ("woe_imp",
+                 SimpleImputer(strategy="constant", fill_value="missing"),
+                 CATEGORICAL_FEATURES_WOE),
+            ],
+            remainder="drop",
+            verbose_feature_names_out=False
+        )
+
+        return Pipeline([
+            ("aggregation", AggregationFeatureGenerator()),
+            ("date_features", DateFeatureExtractor()),
+            ("preprocessing", preprocessor)
+        ])
+
+    # =============================
+    # FIT
+    # =============================
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        y = y.astype(int)
+
+        X_processed = self.pipeline.fit_transform(X, y)
+
+        feature_names = (
+            self.pipeline.named_steps["preprocessing"]
+            .get_feature_names_out()
+        )
+
+        X_df = pd.DataFrame(X_processed, columns=feature_names, index=X.index)
+
+        iv_records = []
+        for col in CATEGORICAL_FEATURES_WOE:
+            woe_map, iv = compute_woe_iv(X_df[col], y)
+            self.woe_maps_[col] = woe_map
+            iv_records.append({"Feature": col, "IV": iv})
+
+        self.iv_summary_ = (
+            pd.DataFrame(iv_records)
+            .sort_values("IV", ascending=False)
+            .reset_index(drop=True)
+        )
+
         return self
 
-    def transform(self, X):
-        return X.drop(columns=self.columns, errors="ignore")
+    # =============================
+    # TRANSFORM
+    # =============================
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        X_processed = self.pipeline.transform(X)
 
+        feature_names = (
+            self.pipeline.named_steps["preprocessing"]
+            .get_feature_names_out()
+        )
 
-# ==================================================
-# Pipeline Builder
-# ==================================================
+        X_df = pd.DataFrame(X_processed, columns=feature_names, index=X.index)
 
-def build_pipeline(use_woe=False, scale_method="standard"):
-    """
-    Build full preprocessing pipeline.
+        woe_features = {}
+        for col in CATEGORICAL_FEATURES_WOE:
+            woe_features[f"{col}_woe"] = (
+                X_df[col].astype(str)
+                .map(self.woe_maps_[col])
+                .fillna(0.0)
+            )
 
-    scale_method: "standard" | "minmax"
-    use_woe: apply WoE encoding (requires xverse)
-    """
+        X_woe = pd.DataFrame(woe_features, index=X.index)
 
-    categorical_cols = [
-        "CurrencyCode", "ProviderId", "ProductId",
-        "ProductCategory", "ChannelId", "PricingStrategy"
-    ]
+        X_final = pd.concat(
+            [X_df.drop(columns=CATEGORICAL_FEATURES_WOE), X_woe],
+            axis=1
+        )
 
-    numerical_cols = [
-        "CountryCode", "Amount", "Value",
-        "TransactionHour", "TransactionDay",
-        "TransactionMonth", "TransactionYear",
-        "TotalTransactionAmount", "AvgTransactionAmount",
-        "TransactionCount", "StdTransactionAmount"
-    ]
+        return X_final
 
-    scaler = StandardScaler() if scale_method == "standard" else MinMaxScaler()
+    # =============================
+    # SAVE TO CSV
+    # =============================
+    def save_processed(self, X: pd.DataFrame,path: str = "../data/processed/processed.csv"):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
 
-    num_pipeline = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", scaler),
-    ])
-
-    if use_woe and WOE_AVAILABLE:
-        cat_pipeline = Pipeline([
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("woe", WoEEncoder(return_df=True)),
-        ])
-    else:
-        cat_pipeline = Pipeline([
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore")),
-        ])
-
-    preprocessor = ColumnTransformer([
-        ("num", num_pipeline, numerical_cols),
-        ("cat", cat_pipeline, categorical_cols),
-    ])
-
-    full_pipeline = Pipeline([
-        ("datetime", DatetimeFeatures()),
-        ("aggregates", TransactionAggregates()),
-        ("drop_ids", DropColumns([
-            "TransactionId", "BatchId", "AccountId",
-            "SubscriptionId", "CustomerId", "TransactionStartTime"
-        ])),
-        ("preprocess", preprocessor),
-    ])
-
-    return full_pipeline
-
-
-# ==================================================
-# Runner
-# ==================================================
-
-def run_data_processing(
-    raw_path="data/raw/data.csv",
-    output_path="data/processed/proccessed.csv",
-    target="FraudResult",
-    use_woe=False,
-    scale_method="standard",
-):
-    """Run full preprocessing and save model-ready data."""
-
-    df = pd.read_csv(raw_path)
-    y = df[target]
-    X = df.drop(columns=[target])
-
-    pipeline = build_pipeline(use_woe=use_woe, scale_method=scale_method)
-    X_processed = pipeline.fit_transform(X, y)
-
-    if hasattr(X_processed, "toarray"):
-        X_processed = X_processed.toarray()
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    processed_df = pd.DataFrame(X_processed)
-    processed_df[target] = y.values
-    processed_df.to_csv(output_path, index=False)
-
-    # Export IV report if WoE used
-    if use_woe and WOE_AVAILABLE:
-        encoder = pipeline.named_steps["preprocess"].named_transformers_["cat"].named_steps["woe"]
-        encoder.iv_df_.to_csv("data/processed/iv_report.csv", index=False)
-
-    return processed_df
-
-
-if __name__ == "__main__":
-    run_data_processing()
+        X.to_csv(path, index=False)
+        print(f"✅ Processed data saved to: {path.resolve()}")
