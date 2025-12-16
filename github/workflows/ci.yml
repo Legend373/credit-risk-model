@@ -25,3 +25,10 @@ jobs:
         run: python --version
         # ✅ Step 4: Example test step — here it just prints the Python version
         # You can replace this with 'pytest' or your test command later.
+      - name: Run Flake8 Linter
+        run: |
+          flake8 src/
+
+      - name: Run Pytest
+        run: |
+          pytest tests/ --maxfail=1 --disable-warnings -v
