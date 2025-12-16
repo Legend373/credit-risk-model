@@ -1,0 +1,16 @@
+pandas
+numpy
+matplotlib
+seaborn
+scipy
+scikit-learn
+jupyterlab
+plotly
+dvc
+dvc[gdrive]
+mlflow
+fastapi
+uvicorn[standard]
+pydantic
+flake8
+pytest
